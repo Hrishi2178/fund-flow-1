@@ -31,9 +31,9 @@ public class Neo4jRepository {
     }
 
     private String getTimeFrom(String timestamp) {
-        // During testing return 30 days ago to catch everything
-        return LocalDateTime.now()
-                .minus(30, ChronoUnit.DAYS)
+        // Return 72 hours before the trigger timestamp
+        return LocalDateTime.parse(timestamp, FMT)
+                .minus(72, ChronoUnit.HOURS)
                 .format(FMT);
     }
 
@@ -160,12 +160,16 @@ public class Neo4jRepository {
             return session.readTransaction(t -> {
 
                 // --- 1. FETCH AND PARSE EDGES ---
-                // We explicitly ask Neo4j for 'a.id' and 'b.id' to avoid internal ID bugs
+                // Get 2-hop neighborhood and transactions between them
                 Result edgeResult = t.run("""
+                    MATCH (start:Account)
+                    WHERE start.id IN [$fromId, $toId]
+                    MATCH (start)-[:TRANSFER*0..2]-(neighbor:Account)
+                    WITH collect(DISTINCT neighbor) AS neighbors
                     MATCH (a:Account)-[r:TRANSFER]->(b:Account)
-                    WHERE (a.id = $fromId OR a.id = $toId 
-                           OR b.id = $fromId OR b.id = $toId)
-                    AND   r.timestamp >= $timeFrom
+                    WHERE a IN neighbors AND b IN neighbors
+                    AND datetime(r.timestamp) >= datetime($timeFrom)
+                    AND datetime(r.timestamp) <= datetime($triggerTs) + duration('PT1H')
                     RETURN a.id AS fromAcc,
                            b.id AS toAcc,
                            r.id AS edgeId,
@@ -177,7 +181,8 @@ public class Neo4jRepository {
                         Map.of(
                                 "fromId",   fromAccount,
                                 "toId",     toAccount,
-                                "timeFrom", getTimeFrom(triggerTimestamp)
+                                "timeFrom", getTimeFrom(triggerTimestamp),
+                                "triggerTs", triggerTimestamp
                         )
                 );
 
@@ -206,15 +211,13 @@ public class Neo4jRepository {
                 }
 
                 // --- 2. FETCH AND PARSE NODES ---
-                // We use the same matching logic to ensure we get ALL connected nodes in the neighborhood
+                // Get all nodes in the 2-hop neighborhood
                 Result nodeResult = t.run("""
-                    MATCH (a:Account)-[r:TRANSFER]->(b:Account)
-                    WHERE (a.id = $fromId OR a.id = $toId 
-                           OR b.id = $fromId OR b.id = $toId)
-                    AND   r.timestamp >= $timeFrom
-                    WITH collect(DISTINCT a) + collect(DISTINCT b) AS rawNodes
-                    UNWIND rawNodes AS n
-                    WITH DISTINCT n AS a
+                    MATCH (start:Account)
+                    WHERE start.id IN [$fromId, $toId]
+                    MATCH (start)-[:TRANSFER*0..2]-(neighbor:Account)
+                    WITH collect(DISTINCT neighbor) AS neighbors
+                    UNWIND neighbors AS a
                     RETURN a.id AS accountId,
                            a.name AS name,
                            a.total_sent AS totalSent,
@@ -229,8 +232,7 @@ public class Neo4jRepository {
                     """,
                         Map.of(
                                 "fromId",   fromAccount,
-                                "toId",     toAccount,
-                                "timeFrom", getTimeFrom(triggerTimestamp)
+                                "toId",     toAccount
                         )
                 );
 
